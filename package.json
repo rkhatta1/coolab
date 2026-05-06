@@ -4,8 +4,11 @@
   "private": true,
   "scripts": {
     "build": "turbo build",
+    "codegen": "pnpm --filter web codegen",
     "dev": "turbo dev",
+    "dev:backend": "turbo dev:backend",
     "lint": "turbo lint",
+    "seed": "pnpm --filter web seed",
     "format": "turbo format",
     "typecheck": "turbo typecheck"
   },

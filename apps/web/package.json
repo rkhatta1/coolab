@@ -5,6 +5,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
+    "dev:backend": "convex dev",
+    "codegen": "convex codegen",
+    "seed": "convex run bootstrap:seed",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
@@ -12,7 +15,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@clerk/nextjs": "^7.3.1",
     "@workspace/ui": "workspace:*",
+    "convex": "^1.37.0",
     "lucide-react": "^1.14.0",
     "next": "16.1.6",
     "next-themes": "^0.4.6",

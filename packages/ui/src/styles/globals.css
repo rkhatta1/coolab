@@ -51,6 +51,8 @@
 }
 
 :root {
+    --font-sans: ui-sans-serif, system-ui, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     --background: oklch(1 0 0);
     --foreground: oklch(0.145 0.008 326);
     --card: oklch(1 0 0);
