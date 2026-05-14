@@ -406,6 +406,43 @@ async function copyToClipboard(value: string) {
   await navigator.clipboard?.writeText(value)
 }
 
+function CopyNodeButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current)
+      }
+    }
+  }, [])
+
+  async function copy() {
+    await copyToClipboard(value)
+    setCopied(true)
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current)
+    }
+    timeoutRef.current = setTimeout(() => setCopied(false), 1200)
+  }
+
+  return (
+    <button
+      className={cn(
+        "grid size-6 place-items-center rounded-md text-[#a1a1aa] transition hover:bg-[#27272a] hover:text-white",
+        copied && "text-[#86efac] hover:text-[#86efac]",
+      )}
+      data-node-control="true"
+      onClick={() => void copy()}
+      title={copied ? "Copied" : "Copy"}
+      type="button"
+    >
+      {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+    </button>
+  )
+}
+
 function initials(name: string) {
   return name
     .split(/\s+/)
@@ -2603,14 +2640,7 @@ function TextNode({
           onPointerDown={(event) => event.stopPropagation()}
           data-node-control="true"
         />
-        <button
-          className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#27272a] hover:text-white"
-          data-node-control="true"
-          onClick={() => void copyToClipboard(node.text ?? nodeHeading(node))}
-          type="button"
-        >
-          <Copy className="size-3.5" />
-        </button>
+        <CopyNodeButton value={node.text ?? nodeHeading(node)} />
         <button
           className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#3f1d1d] hover:text-[#fca5a5]"
           data-node-control="true"
@@ -2754,14 +2784,7 @@ function ImageNode({
             onKeyDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
           />
-          <button
-            className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#27272a] hover:text-white"
-            data-node-control="true"
-            onClick={() => void copyToClipboard(node.imageUrl ?? node.localImageUrl ?? nodeHeading(node))}
-            type="button"
-          >
-            <Copy className="size-3.5" />
-          </button>
+          <CopyNodeButton value={node.imageUrl ?? node.localImageUrl ?? nodeHeading(node)} />
           <button
             className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#3f1d1d] hover:text-[#fca5a5]"
             data-node-control="true"
