@@ -7,6 +7,7 @@ import {
   Check,
   Circle,
   Clock3,
+  Copy,
   Eye,
   Folder,
   GripVertical,
@@ -33,6 +34,7 @@ import {
   FormEvent,
   PointerEvent,
   TouchEvent,
+  WheelEvent,
   useEffect,
   useMemo,
   useRef,
@@ -65,7 +67,7 @@ type Account = {
 
 type CanvasNode = {
   _id: string
-  kind: "text" | "image" | "mixed"
+  kind: "text" | "image" | "mixed" | "image-loading"
   x: number
   y: number
   width: number
@@ -400,6 +402,19 @@ function resizeNodeBox(
   return { x, y, width, height }
 }
 
+function scrollNodeContent(event: WheelEvent<HTMLElement>) {
+  if (event.ctrlKey) return
+
+  event.preventDefault()
+  event.stopPropagation()
+  event.currentTarget.scrollTop += event.deltaY
+}
+
+async function copyToClipboard(value: string) {
+  if (!value.trim()) return
+  await navigator.clipboard?.writeText(value)
+}
+
 function initials(name: string) {
   return name
     .split(/\s+/)
@@ -660,6 +675,14 @@ export function CollabApp() {
     const targetCanvas = canvas
 
     function wheel(event: globalThis.WheelEvent) {
+      if (
+        !event.ctrlKey &&
+        event.target instanceof HTMLElement &&
+        event.target.closest("[data-node-scroll='true']")
+      ) {
+        return
+      }
+
       event.preventDefault()
 
       if (!event.ctrlKey) {
@@ -687,8 +710,14 @@ export function CollabApp() {
     return () => targetCanvas.removeEventListener("wheel", wheel)
   }, [pan, zoom])
 
+  useEffect(() => {
+    if (isAppLoading) return
+    requestAnimationFrame(() => canvasRef.current?.focus({ preventScroll: true }))
+  }, [currentSession?._id, isAppLoading])
+
   const nodes = useMemo(() => {
-    const source = liveNodes ?? localNodes
+    const transientNodes = localNodes.filter((node) => node.kind === "image-loading")
+    const source = liveNodes ? [...liveNodes, ...transientNodes] : localNodes
     return source.map((node) => ({ ...node, ...draftPositions[node._id], ...draftNodeContent[node._id] }))
   }, [draftNodeContent, draftPositions, liveNodes, localNodes])
   const groups = useMemo(() => {
@@ -1046,7 +1075,9 @@ export function CollabApp() {
     const previous = nodes.find((node) => node._id === id)
     if (previous) {
       pushUndo(async () => {
-        if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local") && !id.startsWith("local")) {
+        if (previous.kind === "image-loading") {
+          setLocalNodes((items) => [...items, previous])
+        } else if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local") && !id.startsWith("local")) {
           await createNode({
             sessionId: sessionId(currentSession._id),
             kind: previous.kind,
@@ -1245,7 +1276,7 @@ export function CollabApp() {
     })
   }
 
-  async function addNode(input: Partial<CanvasNode> & Pick<CanvasNode, "kind" | "x" | "y">) {
+  async function addNode(input: Partial<CanvasNode> & { kind: "text" | "image" | "mixed"; x: number; y: number }) {
     if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local")) {
       const id = await createNode({
         sessionId: sessionId(currentSession._id),
@@ -1287,40 +1318,72 @@ export function CollabApp() {
   }
 
   async function addImageFile(file: File, x: number, y: number) {
+    const placeholderId = nextLocalId("uploading-image")
+    const placeholder: CanvasNode = {
+      _id: placeholderId,
+      kind: "image-loading",
+      x,
+      y,
+      width: 360,
+      height: 260,
+      heading: file.name.replace(/\.[^.]+$/, "") || "Pasted image",
+    }
+
+    setLocalNodes((items) => [...items, placeholder])
+    setSelectedNodeId(placeholderId)
+
     if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local")) {
-      const postUrl = await generateUploadUrl()
-      const result = await fetch(postUrl, {
-        method: "POST",
-        headers: { "Content-Type": file.type },
-        body: file,
-      })
-      const { storageId } = await result.json()
-      await createNode({
-        sessionId: sessionId(currentSession._id),
-        kind: "image",
-        x,
-        y,
-        width: 360,
-        height: 260,
-        heading: file.name.replace(/\.[^.]+$/, "") || "Pasted image",
-        storageId,
-        userId: currentUser.id,
-      })
+      try {
+        const postUrl = await generateUploadUrl()
+        const result = await fetch(postUrl, {
+          method: "POST",
+          headers: { "Content-Type": file.type },
+          body: file,
+        })
+        const { storageId } = await result.json()
+        const id = await createNode({
+          sessionId: sessionId(currentSession._id),
+          kind: "image",
+          x,
+          y,
+          width: 360,
+          height: 260,
+          heading: file.name.replace(/\.[^.]+$/, "") || "Pasted image",
+          storageId,
+          userId: currentUser.id,
+        })
+        pushUndo(async () => {
+          await deleteNodeMutation({ nodeId: id, userId: currentUser.id })
+        })
+        setSelectedNodeId(id)
+      } finally {
+        setLocalNodes((items) => items.filter((item) => item._id !== placeholderId))
+      }
       return
     }
 
     const reader = new FileReader()
     reader.onload = () => {
-      void addNode({
-        kind: "image",
-        x,
-        y,
-        width: 320,
-        height: 220,
-        heading: file.name.replace(/\.[^.]+$/, "") || "Pasted image",
-        localImageUrl: String(reader.result),
-        imageUrl: String(reader.result),
-      })
+      const imageUrl = String(reader.result)
+      setLocalNodes((items) =>
+        items.map((item) =>
+          item._id === placeholderId
+            ? {
+                ...item,
+                kind: "image",
+                width: 320,
+                height: 220,
+                localImageUrl: imageUrl,
+                imageUrl,
+              }
+            : item,
+        ),
+      )
+      pushUndo(() => setLocalNodes((items) => items.filter((item) => item._id !== placeholderId)))
+      setSelectedNodeId(placeholderId)
+    }
+    reader.onerror = () => {
+      setLocalNodes((items) => items.filter((item) => item._id !== placeholderId))
     }
     reader.readAsDataURL(file)
   }
@@ -1922,6 +1985,7 @@ export function CollabApp() {
           }}
           onPaste={handlePaste}
           onPointerDown={handleCanvasPointerDown}
+          onPointerEnter={() => canvasRef.current?.focus({ preventScroll: true })}
           onPointerMove={handleCanvasPointerMove}
           onPointerUp={handleCanvasPointerUp}
           onTouchEnd={handleCanvasTouchEnd}
@@ -2353,7 +2417,7 @@ function CanvasNodeView(props: {
   selected: boolean
   zoom: number
 }) {
-  if (props.node.kind === "image") {
+  if (props.node.kind === "image" || props.node.kind === "image-loading") {
     return <ImageNode {...props} />
   }
 
@@ -2558,6 +2622,14 @@ function TextNode({
           data-node-control="true"
         />
         <button
+          className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#27272a] hover:text-white"
+          data-node-control="true"
+          onClick={() => void copyToClipboard(node.text ?? nodeHeading(node))}
+          type="button"
+        >
+          <Copy className="size-3.5" />
+        </button>
+        <button
           className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#3f1d1d] hover:text-[#fca5a5]"
           data-node-control="true"
           onClick={onDelete}
@@ -2575,8 +2647,9 @@ function TextNode({
         {editing ? (
           <textarea
             autoFocus
-            className="h-full w-full resize-none bg-transparent text-sm leading-6 text-[#e4e4e7] outline-none placeholder:text-[#71717a]"
+            className="hide-scrollbar h-full w-full resize-none overflow-y-auto overflow-x-hidden bg-transparent text-sm leading-6 text-[#e4e4e7] outline-none placeholder:text-[#71717a]"
             data-node-control="true"
+            data-node-scroll="true"
             onBlur={() => {
               onTextChange(draftText)
               setEditing(false)
@@ -2590,17 +2663,20 @@ function TextNode({
               }
             }}
             onPointerDown={(event) => event.stopPropagation()}
+            onWheel={scrollNodeContent}
             placeholder="Write here..."
             value={draftText}
           />
         ) : (
           <div
-            className="h-full overflow-auto text-[#e4e4e7]"
+            className="hide-scrollbar h-full overflow-y-auto overflow-x-hidden break-words text-[#e4e4e7]"
+            data-node-scroll="true"
             onDoubleClick={(event) => {
               event.stopPropagation()
               setDraftText(node.text ?? "")
               setEditing(true)
             }}
+            onWheel={scrollNodeContent}
           >
             {node.text?.trim() ? renderMarkdown(node.text) : (
               <p className="text-sm leading-6 text-[#71717a]">Write here...</p>
@@ -2686,25 +2762,42 @@ function ImageNode({
       onPointerUp={pointerUp}
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
-      <div className="absolute -top-9 left-2 right-2 z-0 flex translate-y-3 items-center gap-2 rounded-t-md border border-[#3f3f46]/80 bg-[#18181b]/70 px-2 py-1 opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100">
-        <input
-          className="min-w-0 flex-1 bg-transparent text-xs font-medium text-[#f4f4f5] outline-none"
-          data-node-control="true"
-          defaultValue={nodeHeading(node)}
-          onBlur={(event) => onHeadingChange(event.currentTarget.value)}
-          onKeyDown={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-        />
-        <button
-          className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#3f1d1d] hover:text-[#fca5a5]"
-          data-node-control="true"
-          onClick={onDelete}
-          type="button"
-        >
-          <Trash2 className="size-3.5" />
-        </button>
-      </div>
-      {node.imageUrl || node.localImageUrl ? (
+      {node.kind !== "image-loading" ? (
+        <div className="absolute -top-9 left-2 right-2 z-0 flex translate-y-3 items-center gap-2 rounded-t-md border border-[#3f3f46]/80 bg-[#18181b]/70 px-2 py-1 opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100">
+          <input
+            className="min-w-0 flex-1 bg-transparent text-xs font-medium text-[#f4f4f5] outline-none"
+            data-node-control="true"
+            defaultValue={nodeHeading(node)}
+            onBlur={(event) => onHeadingChange(event.currentTarget.value)}
+            onKeyDown={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+          />
+          <button
+            className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#27272a] hover:text-white"
+            data-node-control="true"
+            onClick={() => void copyToClipboard(node.imageUrl ?? node.localImageUrl ?? nodeHeading(node))}
+            type="button"
+          >
+            <Copy className="size-3.5" />
+          </button>
+          <button
+            className="grid size-6 place-items-center rounded-md text-[#a1a1aa] hover:bg-[#3f1d1d] hover:text-[#fca5a5]"
+            data-node-control="true"
+            onClick={onDelete}
+            type="button"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+      ) : null}
+      {node.kind === "image-loading" ? (
+        <div className="relative z-10 h-full w-full overflow-hidden rounded-md border border-[#3f3f46]/70 bg-[#18181b]/60 shadow-sm">
+          <div className="absolute inset-0 animate-pulse bg-[#27272a]" />
+          <div className="absolute inset-x-5 top-5 h-3 rounded-full bg-[#3f3f46]" />
+          <div className="absolute bottom-5 left-5 right-14 h-3 rounded-full bg-[#3f3f46]/80" />
+          <div className="absolute bottom-5 right-5 size-3 rounded-full bg-[#3f3f46]/80" />
+        </div>
+      ) : node.imageUrl || node.localImageUrl ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img
           alt={nodeHeading(node)}
@@ -2717,7 +2810,7 @@ function ImageNode({
           style={{ width: node.width, height: node.height }}
         />
       ) : null}
-      {selected ? (
+      {selected && node.kind !== "image-loading" ? (
         <NodeResizeHandles node={node} onResize={onResize} onResizeEnd={onResizeEnd} zoom={zoom} />
       ) : null}
     </div>
