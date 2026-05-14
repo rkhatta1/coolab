@@ -2,11 +2,35 @@ import { mutation, query } from "./_generated/server"
 import { v } from "convex/values"
 
 export const list = query({
-  args: {},
-  handler: async (ctx) => {
-    const sessions = await ctx.db.query("sessions").order("desc").take(40)
-    const accounts = await ctx.db.query("accounts").collect()
-    const accountById = new Map(accounts.map((account) => [account._id, account]))
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const collaborators = await ctx.db
+      .query("collaborators")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .collect()
+    const collaboratorSessions = (
+      await Promise.all(collaborators.map((collaborator) => ctx.db.get(collaborator.sessionId)))
+    ).filter((session) => session !== null)
+    const ownedSessions = (await ctx.db.query("sessions").collect()).filter(
+      (session) => session.ownerUserId === args.userId,
+    )
+    const sessionsById = new Map(
+      [...collaboratorSessions, ...ownedSessions].map((session) => [session._id, session]),
+    )
+    const sessions = Array.from(sessionsById.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 40)
+    const accounts = await Promise.all(
+      Array.from(new Set(sessions.map((session) => session.accountId))).map((id) => ctx.db.get(id)),
+    )
+    const accountById = new Map()
+    for (const account of accounts) {
+      if (account) {
+        accountById.set(account._id, account)
+      }
+    }
 
     return sessions.map((session) => ({
       ...session,

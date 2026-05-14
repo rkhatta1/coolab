@@ -204,15 +204,6 @@ function groupHeading(group?: Pick<CanvasGroup, "name">) {
   return group?.name?.trim() || "Group"
 }
 
-const fallbackAccounts: Account[] = [
-  {
-    _id: "local-account-1",
-    name: "Arc Studio",
-    handle: "arc-studio",
-    color: "#0f766e",
-  },
-]
-
 function isProbablyUrl(value: string) {
   return /^https?:\/\//i.test(value.trim())
 }
@@ -502,13 +493,12 @@ export function CollabApp() {
   )
   const liveSessions = useQuery(
     api.sessions.list,
-    isConvexConfigured ? {} : "skip",
+    isLoaded && isConvexConfigured ? { userId: currentUser.id } : "skip",
   ) as Session[] | undefined
   const liveAccounts = useQuery(
     api.accounts.list,
-    isConvexConfigured ? {} : "skip",
+    isLoaded && isConvexConfigured ? { userId: currentUser.id } : "skip",
   ) as Account[] | undefined
-  const seed = useMutation(api.bootstrap.seed)
   const createProject = useMutation(api.accounts.create)
   const updateProject = useMutation(api.accounts.update)
   const createNode = useMutation(api.nodes.create)
@@ -537,7 +527,7 @@ export function CollabApp() {
     [liveSessions, localSessions],
   )
   const accounts = useMemo(
-    () => (isConvexConfigured ? (liveAccounts ?? []) : fallbackAccounts),
+    () => (isConvexConfigured ? (liveAccounts ?? []) : []),
     [liveAccounts],
   )
   const [selectedSessionId, setSelectedSessionId] = useState(sessions[0]?._id)
@@ -624,14 +614,6 @@ export function CollabApp() {
       color: currentUser.color,
     })
   }, [currentUser, isLoaded, upsertUser, user])
-
-  useEffect(() => {
-    if (!isConvexConfigured || liveSessions === undefined || liveSessions.length > 0) {
-      return
-    }
-
-    void seed()
-  }, [liveSessions, seed])
 
   useEffect(() => {
     function down(event: KeyboardEvent) {
@@ -2242,7 +2224,7 @@ export function CollabApp() {
             <div className="rounded-md border border-[#27272a] bg-[#18181b] p-3" key={message._id}>
               <div className="mb-2 flex items-center gap-2">
                 <Circle className="size-3 fill-[#2563eb] text-[#2563eb]" />
-                <span className="text-sm font-medium">{message.userId === currentUser.id ? "You" : "Maya"}</span>
+                <span className="text-sm font-medium">{message.userId === currentUser.id ? "You" : "Member"}</span>
               </div>
               <p className="text-sm leading-6">{message.body}</p>
               {message.taggedNodeIds.length ? (

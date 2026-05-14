@@ -3,9 +3,24 @@ import { v } from "convex/values"
 import { mutation, query } from "./_generated/server"
 
 export const list = query({
-  args: {},
-  handler: async (ctx) => {
-    return await ctx.db.query("accounts").collect()
+  args: {
+    userId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const collaborators = await ctx.db
+      .query("collaborators")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .collect()
+    const sessions = (
+      await Promise.all(collaborators.map((collaborator) => ctx.db.get(collaborator.sessionId)))
+    ).filter((session) => session !== null)
+    const ownedSessions = (await ctx.db.query("sessions").collect()).filter(
+      (session) => session.ownerUserId === args.userId,
+    )
+    const accountIds = new Set([...sessions, ...ownedSessions].map((session) => session.accountId))
+    const accounts = await Promise.all(Array.from(accountIds).map((id) => ctx.db.get(id)))
+
+    return accounts.filter((account) => account !== null)
   },
 })
 
@@ -16,15 +31,6 @@ export const create = mutation({
     color: v.string(),
   },
   handler: async (ctx, args) => {
-    const existing = await ctx.db
-      .query("accounts")
-      .withIndex("by_handle", (q) => q.eq("handle", args.handle))
-      .unique()
-
-    if (existing) {
-      return existing._id
-    }
-
     return await ctx.db.insert("accounts", {
       name: args.name,
       handle: args.handle,
