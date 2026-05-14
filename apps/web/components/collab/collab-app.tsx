@@ -10,7 +10,7 @@ import {
   Eye,
   Folder,
   GripVertical,
-  ImagePlus,
+  Group,
   LogOut,
   MailPlus,
   Minus,
@@ -22,12 +22,13 @@ import {
   Settings,
   Shield,
   Trash2,
-  Type,
+  Ungroup,
   UserMinus,
   X,
 } from "lucide-react"
 import { SignOutButton, useUser } from "@clerk/nextjs"
 import { useMutation, useQuery } from "convex/react"
+import { Caveat } from "next/font/google"
 import {
   FormEvent,
   PointerEvent,
@@ -42,6 +43,8 @@ import { api } from "@/convex/_generated/api"
 import type { Id } from "@/convex/_generated/dataModel"
 import { Button } from "@workspace/ui/components/button"
 import { cn } from "@workspace/ui/lib/utils"
+
+const caveat = Caveat({ subsets: ["latin"], weight: ["700"] })
 
 type Session = {
   _id: string
@@ -73,6 +76,19 @@ type CanvasNode = {
   localImageUrl?: string
   updatedByUserId?: string
 }
+
+type CanvasGroup = {
+  _id: string
+  name: string
+  nodeIds: string[]
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type NodeBox = Pick<CanvasNode, "x" | "y" | "width" | "height">
+type ResizeHandle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
 
 type Message = {
   _id: string
@@ -158,6 +174,10 @@ function nodeId(id: string) {
   return id as Id<"nodes">
 }
 
+function groupId(id: string) {
+  return id as Id<"groups">
+}
+
 function inviteId(id: string) {
   return id as Id<"invites">
 }
@@ -176,6 +196,10 @@ function nodeHeading(node?: Pick<CanvasNode, "heading" | "text" | "kind">) {
   const firstLine = node.text?.split("\n").find((line) => line.trim())
   if (firstLine) return firstLine.replace(/^#+\s*/, "").trim()
   return `${node.kind.charAt(0).toUpperCase()}${node.kind.slice(1)} node`
+}
+
+function groupHeading(group?: Pick<CanvasGroup, "name">) {
+  return group?.name?.trim() || "Group"
 }
 
 const fallbackAccounts: Account[] = [
@@ -286,6 +310,96 @@ function colorForUser(id: string) {
   return colors[hash] ?? "#38bdf8"
 }
 
+function nodeRect(node: Pick<CanvasNode, "x" | "y" | "width" | "height">) {
+  return {
+    left: node.x,
+    top: node.y,
+    right: node.x + node.width,
+    bottom: node.y + node.height,
+  }
+}
+
+function rectsIntersect(
+  first: { left: number; top: number; right: number; bottom: number },
+  second: { left: number; top: number; right: number; bottom: number },
+) {
+  return first.left <= second.right && first.right >= second.left && first.top <= second.bottom && first.bottom >= second.top
+}
+
+function boundsForNodes(nodes: CanvasNode[]) {
+  if (!nodes.length) return null
+  const rects = nodes.map(nodeRect)
+  const left = Math.min(...rects.map((rect) => rect.left))
+  const top = Math.min(...rects.map((rect) => rect.top))
+  const right = Math.max(...rects.map((rect) => rect.right))
+  const bottom = Math.max(...rects.map((rect) => rect.bottom))
+  return { x: left, y: top, width: right - left, height: bottom - top }
+}
+
+function layoutGroupedNodes(nodes: CanvasNode[], origin: { x: number; y: number }) {
+  const padding = 24
+  const gap = 20
+  const columns = 2
+  const maxWidth = Math.max(...nodes.map((node) => node.width), 180)
+  const rows = Math.ceil(nodes.length / columns)
+
+  const rowHeights = Array.from({ length: rows }, (_, row) =>
+    Math.max(...nodes.filter((_, index) => Math.floor(index / columns) === row).map((node) => node.height)),
+  )
+  const rowTops = rowHeights.map((_, row) =>
+    rowHeights.slice(0, row).reduce((sum, height) => sum + height, 0) + row * gap,
+  )
+
+  const positionedNodes = nodes.map((node, index) => {
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    return {
+      ...node,
+      x: origin.x + padding + column * (maxWidth + gap),
+      y: origin.y + padding + (rowTops[row] ?? 0),
+      width: Math.max(node.width, maxWidth),
+    }
+  })
+
+  const height = rowHeights.reduce((sum, height) => sum + height, 0) + Math.max(0, rows - 1) * gap + padding * 2
+  const width = Math.min(nodes.length, columns) * maxWidth + Math.max(0, Math.min(nodes.length, columns) - 1) * gap + padding * 2
+
+  return { positionedNodes, group: { x: origin.x, y: origin.y, width, height } }
+}
+
+function resizeNodeBox(
+  box: NodeBox,
+  handle: ResizeHandle,
+  deltaX: number,
+  deltaY: number,
+) {
+  const minWidth = 140
+  const minHeight = 90
+  let { x, y, width, height } = box
+
+  if (handle.includes("e")) {
+    width = Math.max(minWidth, box.width + deltaX)
+  }
+
+  if (handle.includes("s")) {
+    height = Math.max(minHeight, box.height + deltaY)
+  }
+
+  if (handle.includes("w")) {
+    const nextWidth = Math.max(minWidth, box.width - deltaX)
+    x = box.x + box.width - nextWidth
+    width = nextWidth
+  }
+
+  if (handle.includes("n")) {
+    const nextHeight = Math.max(minHeight, box.height - deltaY)
+    y = box.y + box.height - nextHeight
+    height = nextHeight
+  }
+
+  return { x, y, width, height }
+}
+
 function initials(name: string) {
   return name
     .split(/\s+/)
@@ -385,6 +499,9 @@ export function CollabApp() {
   const createNode = useMutation(api.nodes.create)
   const updateNode = useMutation(api.nodes.update)
   const deleteNodeMutation = useMutation(api.nodes.remove)
+  const createGroup = useMutation(api.groups.create)
+  const updateGroup = useMutation(api.groups.update)
+  const deleteGroupMutation = useMutation(api.groups.remove)
   const createSession = useMutation(api.sessions.create)
   const updateSession = useMutation(api.sessions.update)
   const generateUploadUrl = useMutation(api.nodes.generateUploadUrl)
@@ -429,6 +546,12 @@ export function CollabApp() {
       ? { sessionId: sessionId(currentSession._id) }
       : "skip",
   ) as Presence[] | undefined
+  const liveGroups = useQuery(
+    api.groups.list,
+    isConvexConfigured && currentSession && !currentSession._id.startsWith("local")
+      ? { sessionId: sessionId(currentSession._id) }
+      : "skip",
+  ) as CanvasGroup[] | undefined
   const sessionAccess = useQuery(
     api.invites.listForSession,
     isConvexConfigured && currentSession && !currentSession._id.startsWith("local")
@@ -443,11 +566,19 @@ export function CollabApp() {
   ) as UserInbox | undefined
 
   const [localNodes, setLocalNodes] = useState<CanvasNode[]>([])
+  const [localGroups, setLocalGroups] = useState<CanvasGroup[]>([])
   const [localMessages, setLocalMessages] = useState<Message[]>([])
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [zoom, setZoom] = useState(1)
   const [selectedNodeId, setSelectedNodeId] = useState<string>()
-  const [draftPositions, setDraftPositions] = useState<Record<string, { x: number; y: number }>>({})
+  const [selectedGroupId, setSelectedGroupId] = useState<string>()
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([])
+  const [editingSessionId, setEditingSessionId] = useState<string>()
+  const [draftPositions, setDraftPositions] = useState<Record<string, Partial<Pick<CanvasNode, "x" | "y" | "width" | "height">>>>({})
+  const [draftNodeContent, setDraftNodeContent] = useState<Record<string, Pick<CanvasNode, "heading" | "text">>>({})
+  const [draftGroups, setDraftGroups] = useState<Record<string, Pick<CanvasGroup, "x" | "y" | "width" | "height">>>({})
+  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; x: number; y: number } | null>(null)
+  const [groupNameDraft, setGroupNameDraft] = useState("Group")
   const [chatBody, setChatBody] = useState("")
   const [taggedNodeIds, setTaggedNodeIds] = useState<string[]>([])
   const [inviteModalOpen, setInviteModalOpen] = useState(false)
@@ -461,6 +592,8 @@ export function CollabApp() {
   const [spacePressed, setSpacePressed] = useState(false)
   const lastPresenceAt = useRef(0)
   const localIdCounter = useRef(0)
+  const undoStackRef = useRef<Array<() => Promise<void> | void>>([])
+  const suppressUndoRef = useRef(false)
   const pinchRef = useRef<{ distance: number; zoom: number; centerX: number; centerY: number } | null>(null)
   const panDragRef = useRef<{ startX: number; startY: number; panX: number; panY: number } | null>(null)
   const canvasRef = useRef<HTMLDivElement>(null)
@@ -487,6 +620,18 @@ export function CollabApp() {
 
   useEffect(() => {
     function down(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !(event.target instanceof HTMLInputElement) && !(event.target instanceof HTMLTextAreaElement)) {
+        event.preventDefault()
+        const undo = undoStackRef.current.pop()
+        if (!undo) return
+
+        suppressUndoRef.current = true
+        Promise.resolve(undo()).finally(() => {
+          suppressUndoRef.current = false
+        })
+        return
+      }
+
       if (event.code === "Space" && !(event.target instanceof HTMLInputElement) && !(event.target instanceof HTMLTextAreaElement)) {
         event.preventDefault()
         setSpacePressed(true)
@@ -526,8 +671,8 @@ export function CollabApp() {
       }
 
       const rect = targetCanvas.getBoundingClientRect()
-      const direction = event.deltaY > 0 ? -1 : 1
-      const nextZoom = clampZoom(zoom * (1 + direction * 0.12))
+      const zoomSensitivity = 0.002
+      const nextZoom = clampZoom(zoom * Math.exp(-event.deltaY * zoomSensitivity))
       const worldX = (event.clientX - rect.left - pan.x) / zoom
       const worldY = (event.clientY - rect.top - pan.y) / zoom
 
@@ -544,9 +689,47 @@ export function CollabApp() {
 
   const nodes = useMemo(() => {
     const source = liveNodes ?? localNodes
-    return source.map((node) => ({ ...node, ...draftPositions[node._id] }))
-  }, [draftPositions, liveNodes, localNodes])
+    return source.map((node) => ({ ...node, ...draftPositions[node._id], ...draftNodeContent[node._id] }))
+  }, [draftNodeContent, draftPositions, liveNodes, localNodes])
+  const groups = useMemo(() => {
+    const source = liveGroups ?? localGroups
+    return source
+      .filter((group) => group.nodeIds.some((id) => nodes.some((node) => node._id === id)))
+      .map((group) => ({ ...group, ...draftGroups[group._id] }))
+  }, [draftGroups, liveGroups, localGroups, nodes])
+  const groupedNodeIds = useMemo(
+    () => new Set(groups.flatMap((group) => group.nodeIds)),
+    [groups],
+  )
+  const selectedBounds = useMemo(
+    () => boundsForNodes(nodes.filter((node) => selectedNodeIds.includes(node._id))),
+    [nodes, selectedNodeIds],
+  )
   const messages = liveMessages ?? localMessages
+
+  useEffect(() => {
+    if (!liveNodes?.length) return
+
+    setDraftNodeContent((items) => {
+      let changed = false
+      const nextItems = { ...items }
+
+      for (const node of liveNodes) {
+        const draft = nextItems[node._id]
+        if (!draft) continue
+
+        const textMatches = draft.text === undefined || draft.text === node.text
+        const headingMatches = draft.heading === undefined || draft.heading === node.heading
+
+        if (textMatches && headingMatches) {
+          delete nextItems[node._id]
+          changed = true
+        }
+      }
+
+      return changed ? nextItems : items
+    })
+  }, [liveNodes])
   const presence = livePresence ?? []
   const activeParticipants = [
     {
@@ -619,10 +802,23 @@ export function CollabApp() {
     return `${prefix}-${localIdCounter.current}`
   }
 
+  function pushUndo(action: () => Promise<void> | void) {
+    if (suppressUndoRef.current) return
+    undoStackRef.current = [...undoStackRef.current.slice(-49), action]
+  }
+
   function handleCanvasPointerDown(event: PointerEvent<HTMLDivElement>) {
     if (event.button !== 0 || (!spacePressed && event.target !== event.currentTarget)) return
 
     event.currentTarget.setPointerCapture(event.pointerId)
+    if (!spacePressed) {
+      const point = relativePoint(event, event.currentTarget, pan, zoom)
+      setSelectionBox({ startX: point.x, startY: point.y, x: point.x, y: point.y })
+      setSelectedNodeId(undefined)
+      setSelectedGroupId(undefined)
+      return
+    }
+
     panDragRef.current = {
       startX: event.clientX,
       startY: event.clientY,
@@ -633,6 +829,34 @@ export function CollabApp() {
 
   function handleCanvasPointerUp() {
     panDragRef.current = null
+    if (selectionBox) {
+      const width = Math.abs(selectionBox.x - selectionBox.startX)
+      const height = Math.abs(selectionBox.y - selectionBox.startY)
+
+      if (width < 4 && height < 4) {
+        setSelectedNodeId(undefined)
+        setSelectedGroupId(undefined)
+        setSelectedNodeIds([])
+        setSelectionBox(null)
+        return
+      }
+
+      const rect = {
+        left: Math.min(selectionBox.startX, selectionBox.x),
+        top: Math.min(selectionBox.startY, selectionBox.y),
+        right: Math.max(selectionBox.startX, selectionBox.x),
+        bottom: Math.max(selectionBox.startY, selectionBox.y),
+      }
+
+      const nextSelectedNodeIds = nodes
+        .filter((node) => !groupedNodeIds.has(node._id) && rectsIntersect(nodeRect(node), rect))
+        .map((node) => node._id)
+
+      setSelectedNodeIds(nextSelectedNodeIds)
+      setSelectedNodeId(undefined)
+      setSelectedGroupId(undefined)
+      setSelectionBox(null)
+    }
   }
 
   function touchDistance(event: TouchEvent<HTMLDivElement>) {
@@ -767,7 +991,22 @@ export function CollabApp() {
   }
 
   async function updateNodeHeading(id: string, heading: string) {
+    const previous = nodes.find((node) => node._id === id)?.heading
+    if (previous === heading) return
+
+    pushUndo(async () => {
+      if (isConvexConfigured && !id.startsWith("local")) {
+        setDraftNodeContent((items) => ({ ...items, [id]: { ...items[id], heading: previous } }))
+        await updateNode({ nodeId: nodeId(id), heading: previous ?? "", userId: currentUser.id })
+      } else {
+        setLocalNodes((items) =>
+          items.map((item) => (item._id === id ? { ...item, heading: previous } : item)),
+        )
+      }
+    })
+
     if (isConvexConfigured && !id.startsWith("local")) {
+      setDraftNodeContent((items) => ({ ...items, [id]: { ...items[id], heading } }))
       await updateNode({ nodeId: nodeId(id), heading, userId: currentUser.id })
       return
     }
@@ -778,7 +1017,22 @@ export function CollabApp() {
   }
 
   async function updateNodeText(id: string, text: string) {
+    const previous = nodes.find((node) => node._id === id)?.text
+    if ((previous ?? "") === text) return
+
+    pushUndo(async () => {
+      if (isConvexConfigured && !id.startsWith("local")) {
+        setDraftNodeContent((items) => ({ ...items, [id]: { ...items[id], text: previous } }))
+        await updateNode({ nodeId: nodeId(id), text: previous ?? "", userId: currentUser.id })
+      } else {
+        setLocalNodes((items) =>
+          items.map((item) => (item._id === id ? { ...item, text: previous } : item)),
+        )
+      }
+    })
+
     if (isConvexConfigured && !id.startsWith("local")) {
+      setDraftNodeContent((items) => ({ ...items, [id]: { ...items[id], text } }))
       await updateNode({ nodeId: nodeId(id), text, userId: currentUser.id })
       return
     }
@@ -789,6 +1043,28 @@ export function CollabApp() {
   }
 
   async function deleteNode(id: string) {
+    const previous = nodes.find((node) => node._id === id)
+    if (previous) {
+      pushUndo(async () => {
+        if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local") && !id.startsWith("local")) {
+          await createNode({
+            sessionId: sessionId(currentSession._id),
+            kind: previous.kind,
+            x: previous.x,
+            y: previous.y,
+            width: previous.width,
+            height: previous.height,
+            heading: previous.heading,
+            text: previous.text,
+            localImageUrl: previous.localImageUrl,
+            userId: currentUser.id,
+          })
+        } else {
+          setLocalNodes((items) => [...items, previous])
+        }
+      })
+    }
+
     if (isConvexConfigured && !id.startsWith("local")) {
       await deleteNodeMutation({ nodeId: nodeId(id), userId: currentUser.id })
     } else {
@@ -796,12 +1072,182 @@ export function CollabApp() {
     }
 
     setSelectedNodeId((value) => (value === id ? undefined : value))
+    setSelectedNodeIds((items) => items.filter((item) => item !== id))
+    setDraftNodeContent((items) => {
+      const nextItems = { ...items }
+      delete nextItems[id]
+      return nextItems
+    })
     setTaggedNodeIds((items) => items.filter((item) => item !== id))
+  }
+
+  async function updateGroupName(id: string, name: string) {
+    const nextName = name.trim() || "Group"
+    const previous = groups.find((group) => group._id === id)?.name
+    if (previous === nextName) return
+
+    pushUndo(async () => {
+      if (isConvexConfigured && !id.startsWith("local")) {
+        await updateGroup({ groupId: groupId(id), name: previous ?? "Group", userId: currentUser.id })
+      } else {
+        setLocalGroups((items) => items.map((item) => (item._id === id ? { ...item, name: previous ?? "Group" } : item)))
+      }
+    })
+
+    if (isConvexConfigured && !id.startsWith("local")) {
+      await updateGroup({ groupId: groupId(id), name: nextName, userId: currentUser.id })
+      return
+    }
+
+    setLocalGroups((items) => items.map((item) => (item._id === id ? { ...item, name: nextName } : item)))
+  }
+
+  async function ungroupNodes(id: string) {
+    const group = groups.find((item) => item._id === id)
+    if (!group) return
+
+    pushUndo(async () => {
+      if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local") && !id.startsWith("local")) {
+        await createGroup({
+          sessionId: sessionId(currentSession._id),
+          name: group.name,
+          nodeIds: group.nodeIds,
+          x: group.x,
+          y: group.y,
+          width: group.width,
+          height: group.height,
+          userId: currentUser.id,
+        })
+      } else {
+        setLocalGroups((items) => [...items, group])
+      }
+    })
+
+    if (isConvexConfigured && !id.startsWith("local")) {
+      await deleteGroupMutation({ groupId: groupId(id), userId: currentUser.id })
+    } else {
+      setLocalGroups((items) => items.filter((item) => item._id !== id))
+    }
+
+    setSelectedGroupId(undefined)
+    setSelectedNodeIds(group.nodeIds)
+    setTaggedNodeIds((items) => items.filter((item) => item !== `group:${id}`))
+  }
+
+  async function groupSelectedNodes() {
+    if (!currentSession || selectedNodeIds.length < 2) return
+    const selectedNodes = selectedNodeIds
+      .map((id) => nodes.find((node) => node._id === id))
+      .filter(Boolean) as CanvasNode[]
+    const bounds = boundsForNodes(selectedNodes)
+    if (!bounds) return
+
+    const name = groupNameDraft.trim() || "Group"
+    const layout = layoutGroupedNodes(selectedNodes, { x: bounds.x, y: bounds.y })
+    const previousNodes = selectedNodes.map((node) => ({ ...node }))
+
+    await Promise.all(
+      layout.positionedNodes.map((node) => {
+        if (isConvexConfigured && !node._id.startsWith("local")) {
+          return updateNode({ nodeId: nodeId(node._id), x: node.x, y: node.y, width: node.width, userId: currentUser.id })
+        }
+
+        setLocalNodes((items) => items.map((item) => (item._id === node._id ? { ...item, x: node.x, y: node.y, width: node.width } : item)))
+        return Promise.resolve()
+      }),
+    )
+
+    if (isConvexConfigured && !currentSession._id.startsWith("local")) {
+      const id = await createGroup({
+        sessionId: sessionId(currentSession._id),
+        name,
+        nodeIds: selectedNodes.map((node) => node._id),
+        ...layout.group,
+        userId: currentUser.id,
+      })
+      pushUndo(async () => {
+        await deleteGroupMutation({ groupId: id, userId: currentUser.id })
+        await Promise.all(
+          previousNodes.map((node) =>
+            updateNode({ nodeId: nodeId(node._id), x: node.x, y: node.y, width: node.width, height: node.height, userId: currentUser.id }),
+          ),
+        )
+      })
+    } else {
+      const id = nextLocalId("local-group")
+      setLocalGroups((items) => [
+        ...items,
+        {
+          _id: id,
+          name,
+          nodeIds: selectedNodes.map((node) => node._id),
+          ...layout.group,
+        },
+      ])
+      pushUndo(() => {
+        setLocalGroups((items) => items.filter((item) => item._id !== id))
+        setLocalNodes((items) =>
+          items.map((item) => previousNodes.find((node) => node._id === item._id) ?? item),
+        )
+      })
+    }
+
+    setDraftPositions({})
+    setSelectedNodeIds([])
+    setGroupNameDraft("Group")
+  }
+
+  async function moveGroup(group: CanvasGroup, next: Pick<CanvasGroup, "x" | "y">) {
+    const dx = next.x - group.x
+    const dy = next.y - group.y
+    if (!dx && !dy) return
+
+    const childNodes = nodes.filter((node) => group.nodeIds.includes(node._id))
+    const previousNodes = childNodes.map((node) => ({ ...node }))
+    const previousGroup = { ...group }
+
+    pushUndo(async () => {
+      if (isConvexConfigured && !group._id.startsWith("local")) {
+        await Promise.all([
+          updateGroup({ groupId: groupId(group._id), x: previousGroup.x, y: previousGroup.y, userId: currentUser.id }),
+          ...previousNodes.map((node) =>
+            updateNode({ nodeId: nodeId(node._id), x: node.x, y: node.y, userId: currentUser.id }),
+          ),
+        ])
+      } else {
+        setLocalGroups((items) => items.map((item) => (item._id === previousGroup._id ? previousGroup : item)))
+        setLocalNodes((items) =>
+          items.map((item) => previousNodes.find((node) => node._id === item._id) ?? item),
+        )
+      }
+    })
+
+    if (isConvexConfigured && !group._id.startsWith("local")) {
+      await Promise.all([
+        updateGroup({ groupId: groupId(group._id), x: next.x, y: next.y, userId: currentUser.id }),
+        ...childNodes.map((node) =>
+          updateNode({ nodeId: nodeId(node._id), x: node.x + dx, y: node.y + dy, userId: currentUser.id }),
+        ),
+      ])
+    } else {
+      setLocalGroups((items) => items.map((item) => (item._id === group._id ? { ...item, x: next.x, y: next.y } : item)))
+      setLocalNodes((items) =>
+        items.map((item) =>
+          group.nodeIds.includes(item._id) ? { ...item, x: item.x + dx, y: item.y + dy } : item,
+        ),
+      )
+    }
+
+    setDraftGroups((items) => {
+      const nextItems = { ...items }
+      delete nextItems[group._id]
+      return nextItems
+    })
   }
 
   async function addNode(input: Partial<CanvasNode> & Pick<CanvasNode, "kind" | "x" | "y">) {
     if (isConvexConfigured && currentSession && !currentSession._id.startsWith("local")) {
-      await createNode({
+      const id = await createNode({
         sessionId: sessionId(currentSession._id),
         kind: input.kind,
         x: input.x,
@@ -813,13 +1259,18 @@ export function CollabApp() {
         localImageUrl: input.localImageUrl,
         userId: currentUser.id,
       })
+      pushUndo(async () => {
+        await deleteNodeMutation({ nodeId: id, userId: currentUser.id })
+      })
+      setSelectedNodeId(id)
       return
     }
 
+    const id = `local-node-${Date.now()}`
     setLocalNodes((items) => [
       ...items,
       {
-        _id: `local-node-${Date.now()}`,
+        _id: id,
         kind: input.kind,
         x: input.x,
         y: input.y,
@@ -831,6 +1282,8 @@ export function CollabApp() {
         localImageUrl: input.localImageUrl,
       },
     ])
+    pushUndo(() => setLocalNodes((items) => items.filter((item) => item._id !== id)))
+    setSelectedNodeId(id)
   }
 
   async function addImageFile(file: File, x: number, y: number) {
@@ -917,6 +1370,11 @@ export function CollabApp() {
     }
 
     const point = relativePoint(event, canvas, pan, zoom)
+    if (selectionBox) {
+      setSelectionBox((value) => (value ? { ...value, x: point.x, y: point.y } : value))
+      return
+    }
+
     const now = Date.now()
     if (isConvexConfigured && now - lastPresenceAt.current > 450 && !currentSession._id.startsWith("local")) {
       lastPresenceAt.current = now
@@ -962,6 +1420,20 @@ export function CollabApp() {
   }
 
   function centerNode(nodeId: string) {
+    if (nodeId.startsWith("group:")) {
+      const group = groups.find((item) => item._id === nodeId.slice("group:".length))
+      const canvas = canvasRef.current
+      if (!group || !canvas) return
+
+      setSelectedGroupId(group._id)
+      setSelectedNodeId(undefined)
+      setPan({
+        x: canvas.clientWidth / 2 - (group.x + group.width / 2) * zoom,
+        y: canvas.clientHeight / 2 - (group.y + group.height / 2) * zoom,
+      })
+      return
+    }
+
     const node = nodes.find((item) => item._id === nodeId)
     const canvas = canvasRef.current
     if (!node || !canvas) return
@@ -971,6 +1443,14 @@ export function CollabApp() {
       x: canvas.clientWidth / 2 - (node.x + node.width / 2) * zoom,
       y: canvas.clientHeight / 2 - (node.y + node.height / 2) * zoom,
     })
+  }
+
+  function tagLabel(id: string) {
+    if (id.startsWith("group:")) {
+      return groupHeading(groups.find((group) => group._id === id.slice("group:".length)))
+    }
+
+    return nodeHeading(nodes.find((node) => node._id === id))
   }
 
   function updateInviteDraft(index: number, patch: Partial<InviteDraft>) {
@@ -1267,7 +1747,7 @@ export function CollabApp() {
       ) : null}
       <aside className="flex w-[300px] shrink-0 flex-col border-r border-[#27272a] bg-[#111113]">
         <div className="flex items-center border-b border-[#27272a] h-14 px-4">
-          <h1 className="text-lg font-semibold">Project Rooms</h1>
+          <h1 className={cn(caveat.className, "text-3xl font-bold leading-none")}>Coolab</h1>
         </div>
 
         <div className="border-b border-[#27272a] p-3">
@@ -1297,7 +1777,7 @@ export function CollabApp() {
                   <Plus />
                 </Button>
               </div>
-              <div className="p-1">
+              <div className="flex flex-col space-y-1 p-1">
                 {accountSessions.map((session) => (
                   <div
                     className={cn(
@@ -1305,16 +1785,55 @@ export function CollabApp() {
                       currentSession?._id === session._id ? "bg-[#27272a]" : "hover:bg-[#202024]",
                     )}
                     key={session._id}
+                    onClick={() => {
+                      if (currentSession?._id === session._id) {
+                        setEditingSessionId(session._id)
+                        return
+                      }
+
+                      setSelectedSessionId(session._id)
+                      setEditingSessionId(undefined)
+                    }}
                   >
-                    <button className="shrink-0" onClick={() => setSelectedSessionId(session._id)} type="button">
+                    <button
+                      className="shrink-0"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setSelectedSessionId(session._id)
+                        setEditingSessionId(undefined)
+                      }}
+                      type="button"
+                    >
                       <ChevronRight className="size-4 text-[#71717a]" />
                     </button>
-                    <input
-                      className="min-w-0 flex-1 bg-transparent text-sm outline-none"
-                      defaultValue={session.title}
-                      onBlur={(event) => void renameSession(session, event.currentTarget.value)}
-                      onFocus={() => setSelectedSessionId(session._id)}
-                    />
+                    {editingSessionId === session._id ? (
+                      <input
+                        autoFocus
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none"
+                        defaultValue={session.title}
+                        onBlur={(event) => {
+                          void renameSession(session, event.currentTarget.value)
+                          setEditingSessionId(undefined)
+                        }}
+                        onClick={(event) => event.stopPropagation()}
+                        onKeyDown={(event) => {
+                          event.stopPropagation()
+                          if (event.key === "Enter") {
+                            event.currentTarget.blur()
+                          }
+                          if (event.key === "Escape") {
+                            setEditingSessionId(undefined)
+                          }
+                        }}
+                      />
+                    ) : (
+                      <button
+                        className="min-w-0 flex-1 truncate bg-transparent text-left text-sm outline-none"
+                        type="button"
+                      >
+                        {session.title}
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1396,6 +1915,10 @@ export function CollabApp() {
               event.preventDefault()
               void deleteNode(selectedNodeId)
             }
+            if ((event.key === "Delete" || event.key === "Backspace") && selectedGroupId) {
+              event.preventDefault()
+              void ungroupNodes(selectedGroupId)
+            }
           }}
           onPaste={handlePaste}
           onPointerDown={handleCanvasPointerDown}
@@ -1413,18 +1936,12 @@ export function CollabApp() {
               variant="ghost"
               onClick={() => void addNode({ kind: "text", x: (220 - pan.x) / zoom, y: (140 - pan.y) / zoom, heading: "Untitled", text: "" })}
             >
-              <Type />
-            </Button>
-            <Button size="icon-sm" variant="ghost">
-              <ImagePlus />
-            </Button>
-            <Button size="icon-sm" variant="ghost">
-              <MousePointer2 />
+              <Plus />
             </Button>
           </div>
 
           <div
-            className="absolute left-0 top-0 h-full w-full"
+            className="pointer-events-none absolute left-0 top-0 h-full w-full"
             style={{
               backgroundImage: "radial-gradient(circle, #3f3f46 1px, transparent 1px)",
               backgroundPosition: `${pan.x}px ${pan.y}px`,
@@ -1438,15 +1955,88 @@ export function CollabApp() {
               transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
             }}
           >
+            {groups.map((group) => (
+              <GroupView
+                key={group._id}
+                group={group}
+                disableDrag={spacePressed}
+                onDrag={(x, y) => {
+                  const dx = x - group.x
+                  const dy = y - group.y
+                  setDraftGroups((items) => ({ ...items, [group._id]: { x, y, width: group.width, height: group.height } }))
+                  setDraftPositions((items) => ({
+                    ...items,
+                    ...Object.fromEntries(
+                      nodes
+                        .filter((node) => group.nodeIds.includes(node._id))
+                        .map((node) => [node._id, { x: node.x + dx, y: node.y + dy }]),
+                    ),
+                  }))
+                }}
+                onDragEnd={(x, y) => void moveGroup(group, { x, y })}
+                onNameChange={(name) => void updateGroupName(group._id, name)}
+                onSelect={() => {
+                  setSelectedGroupId(group._id)
+                  setSelectedNodeId(undefined)
+                  setSelectedNodeIds([])
+                }}
+                onUngroup={() => void ungroupNodes(group._id)}
+                selected={selectedGroupId === group._id}
+                zoom={zoom}
+              />
+            ))}
+            {selectedBounds && selectedNodeIds.length > 1 ? (
+              <form
+                className="absolute z-40 flex items-center gap-1 rounded-md border border-[#27272a] bg-[#18181b]/95 p-1 shadow-lg backdrop-blur-md"
+                style={{ left: selectedBounds.x + selectedBounds.width / 2 - 82, top: selectedBounds.y - 52 }}
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  void groupSelectedNodes()
+                }}
+              >
+                <input
+                  className="h-8 w-28 bg-transparent px-2 text-xs outline-none"
+                  onChange={(event) => setGroupNameDraft(event.target.value)}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  value={groupNameDraft}
+                />
+                <Button size="icon-sm" type="submit" variant="ghost">
+                  <Group />
+                </Button>
+              </form>
+            ) : null}
+            {selectionBox ? (
+              <div
+                className="pointer-events-none absolute z-40 border border-dashed border-white/70 bg-white/5"
+                style={{
+                  left: Math.min(selectionBox.startX, selectionBox.x),
+                  top: Math.min(selectionBox.startY, selectionBox.y),
+                  width: Math.abs(selectionBox.x - selectionBox.startX),
+                  height: Math.abs(selectionBox.y - selectionBox.startY),
+                }}
+              />
+            ) : null}
             {nodes.map((node) => (
               <CanvasNodeView
                 key={node._id}
                 node={node}
-                disableDrag={spacePressed}
+                disableDrag={spacePressed || groupedNodeIds.has(node._id)}
                 onCenter={() => centerNode(node._id)}
                 onDelete={() => void deleteNode(node._id)}
                 onDrag={(x, y) => setDraftPositions((items) => ({ ...items, [node._id]: { x, y } }))}
-                onDragEnd={(x, y) => {
+                onDragEnd={(x, y, previousX, previousY) => {
+                  if (x === previousX && y === previousY) return
+                  pushUndo(async () => {
+                    if (isConvexConfigured && !node._id.startsWith("local")) {
+                      await updateNode({ nodeId: nodeId(node._id), x: previousX, y: previousY, userId: currentUser.id })
+                    } else {
+                      setLocalNodes((items) =>
+                        items.map((item) => (item._id === node._id ? { ...item, x: previousX, y: previousY } : item)),
+                      )
+                    }
+                  })
+
                   if (isConvexConfigured && !node._id.startsWith("local")) {
                     void updateNode({ nodeId: nodeId(node._id), x, y, userId: currentUser.id })
                   } else {
@@ -1456,9 +2046,67 @@ export function CollabApp() {
                   }
                 }}
                 onHeadingChange={(heading) => void updateNodeHeading(node._id, heading)}
-                onSelect={() => setSelectedNodeId(node._id)}
+                onResize={(next) => setDraftPositions((items) => ({ ...items, [node._id]: next }))}
+                onResizeEnd={(next, previous) => {
+                  if (
+                    next.x === previous.x &&
+                    next.y === previous.y &&
+                    next.width === previous.width &&
+                    next.height === previous.height
+                  ) {
+                    return
+                  }
+
+                  pushUndo(async () => {
+                    if (isConvexConfigured && !node._id.startsWith("local")) {
+                      await updateNode({
+                        nodeId: nodeId(node._id),
+                        x: previous.x,
+                        y: previous.y,
+                        width: previous.width,
+                        height: previous.height,
+                        userId: currentUser.id,
+                      })
+                    } else {
+                      setLocalNodes((items) =>
+                        items.map((item) => (item._id === node._id ? { ...item, ...previous } : item)),
+                      )
+                    }
+                  })
+
+                  if (isConvexConfigured && !node._id.startsWith("local")) {
+                    void updateNode({
+                      nodeId: nodeId(node._id),
+                      x: next.x,
+                      y: next.y,
+                      width: next.width,
+                      height: next.height,
+                      userId: currentUser.id,
+                    })
+                  } else {
+                    setLocalNodes((items) =>
+                      items.map((item) => (item._id === node._id ? { ...item, ...next } : item)),
+                    )
+                  }
+                }}
+                onSelect={(event) => {
+                  setSelectedGroupId(undefined)
+                  if (event.shiftKey && !groupedNodeIds.has(node._id)) {
+                    setSelectedNodeId(undefined)
+                    setSelectedNodeIds((items) =>
+                      items.includes(node._id)
+                        ? items.filter((item) => item !== node._id)
+                        : [...items, node._id],
+                    )
+                    return
+                  }
+
+                  setSelectedNodeId(node._id)
+                  setSelectedNodeIds([])
+                }}
+                onStartEdit={() => setSelectedNodeId(node._id)}
                 onTextChange={(text) => void updateNodeText(node._id, text)}
-                selected={selectedNodeId === node._id}
+                selected={selectedNodeId === node._id || selectedNodeIds.includes(node._id)}
                 zoom={zoom}
               />
             ))}
@@ -1542,7 +2190,7 @@ export function CollabApp() {
                       onClick={() => centerNode(nodeId)}
                     >
                       <AtSign className="size-3" />
-                      {nodeHeading(nodes.find((node) => node._id === nodeId))}
+                      {tagLabel(nodeId)}
                     </button>
                   ))}
                 </div>
@@ -1552,18 +2200,21 @@ export function CollabApp() {
         </div> : null}
 
         {!chatCollapsed ? <form className="animate-in fade-in-0 slide-in-from-right-2 border-t border-[#27272a] p-4 duration-150 ease-out" onSubmit={submitMessage}>
-          {selectedNodeId ? (
+          {selectedNodeId || selectedGroupId ? (
             <button
               className="mb-2 inline-flex items-center gap-1 rounded-full border border-[#3f3f46] bg-[#18181b] px-2 py-1 text-xs"
-              onClick={() =>
+              onClick={() => {
+                const tagId = selectedGroupId ? `group:${selectedGroupId}` : selectedNodeId
+                if (!tagId) return
+
                 setTaggedNodeIds((items) =>
-                  items.includes(selectedNodeId) ? items : [...items, selectedNodeId],
+                  items.includes(tagId) ? items : [...items, tagId],
                 )
-              }
+              }}
               type="button"
             >
               <AtSign className="size-3" />
-              Tag {nodeHeading(nodes.find((node) => node._id === selectedNodeId))}
+              Tag {selectedGroupId ? tagLabel(`group:${selectedGroupId}`) : tagLabel(selectedNodeId ?? "")}
             </button>
           ) : null}
           <textarea
@@ -1575,9 +2226,15 @@ export function CollabApp() {
           <div className="mt-2 flex items-center justify-between">
             <div className="flex flex-wrap gap-1">
               {taggedNodeIds.map((nodeId) => (
-                <span className="rounded-full bg-[#27272a] px-2 py-1 text-xs" key={nodeId}>
-                  @{nodeHeading(nodes.find((node) => node._id === nodeId))}
-                </span>
+                <button
+                  className="inline-flex animate-in zoom-in-95 fade-in-0 items-center gap-1 rounded-full bg-[#27272a] px-2 py-1 text-xs duration-150 ease-out hover:bg-[#3f3f46]"
+                  key={nodeId}
+                  onClick={() => setTaggedNodeIds((items) => items.filter((item) => item !== nodeId))}
+                  type="button"
+                >
+                  @{tagLabel(nodeId)}
+                  <X className="size-3" />
+                </button>
               ))}
             </div>
             <Button size="sm" type="submit">
@@ -1591,15 +2248,107 @@ export function CollabApp() {
   )
 }
 
+function GroupView({
+  disableDrag,
+  group,
+  onDrag,
+  onDragEnd,
+  onNameChange,
+  onSelect,
+  onUngroup,
+  selected,
+  zoom,
+}: {
+  group: CanvasGroup
+  disableDrag: boolean
+  onDrag: (x: number, y: number) => void
+  onDragEnd: (x: number, y: number) => void
+  onNameChange: (name: string) => void
+  onSelect: () => void
+  onUngroup: () => void
+  selected: boolean
+  zoom: number
+}) {
+  const drag = useRef<{ startX: number; startY: number; groupX: number; groupY: number } | null>(null)
+
+  function pointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (disableDrag) return
+    if ((event.target as HTMLElement).closest("[data-group-control='true']")) return
+
+    event.currentTarget.setPointerCapture(event.pointerId)
+    drag.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      groupX: group.x,
+      groupY: group.y,
+    }
+    onSelect()
+  }
+
+  function pointerMove(event: PointerEvent<HTMLDivElement>) {
+    if (!drag.current) return
+    onDrag(
+      drag.current.groupX + (event.clientX - drag.current.startX) / zoom,
+      drag.current.groupY + (event.clientY - drag.current.startY) / zoom,
+    )
+  }
+
+  function pointerUp(event: PointerEvent<HTMLDivElement>) {
+    if (!drag.current) return
+    const x = drag.current.groupX + (event.clientX - drag.current.startX) / zoom
+    const y = drag.current.groupY + (event.clientY - drag.current.startY) / zoom
+    drag.current = null
+    onDragEnd(x, y)
+  }
+
+  return (
+    <div
+      className={cn("group absolute z-0", selected && "z-10")}
+      onPointerDown={pointerDown}
+      onPointerMove={pointerMove}
+      onPointerUp={pointerUp}
+      style={{ left: group.x, top: group.y, width: group.width, height: group.height }}
+    >
+      <div className="pointer-events-auto absolute -top-9 left-4 right-4 z-0 flex translate-y-3 items-center rounded-t-md border border-white/40 bg-[#18181b]/70 px-2 py-1 opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100">
+        <input
+          className="min-w-0 flex-1 bg-transparent text-xs font-medium text-[#f4f4f5] outline-none"
+          data-group-control="true"
+          defaultValue={groupHeading(group)}
+          onBlur={(event) => onNameChange(event.currentTarget.value)}
+          onKeyDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        />
+      </div>
+      <div
+        className={cn(
+          "h-full rounded-lg border border-dashed border-white/70 bg-white/[0.02] transition",
+          selected && "bg-white/[0.04]",
+        )}
+      />
+      <button
+        className="pointer-events-auto absolute -bottom-9 left-1/2 z-30 grid size-8 -translate-x-1/2 -translate-y-3 place-items-center rounded-md border border-[#3f3f46] bg-[#18181b]/90 text-[#a1a1aa] opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100 hover:border-[#71717a] hover:text-white"
+        data-group-control="true"
+        onClick={onUngroup}
+        type="button"
+      >
+        <Ungroup className="size-4" />
+      </button>
+    </div>
+  )
+}
+
 function CanvasNodeView(props: {
   node: CanvasNode
   disableDrag: boolean
   onCenter: () => void
   onDelete: () => void
   onDrag: (x: number, y: number) => void
-  onDragEnd: (x: number, y: number) => void
+  onDragEnd: (x: number, y: number, previousX: number, previousY: number) => void
   onHeadingChange: (heading: string) => void
-  onSelect: () => void
+  onResize: (box: NodeBox) => void
+  onResizeEnd: (box: NodeBox, previous: NodeBox) => void
+  onSelect: (event: PointerEvent<HTMLDivElement>) => void
+  onStartEdit: () => void
   onTextChange: (text: string) => void
   selected: boolean
   zoom: number
@@ -1611,6 +2360,95 @@ function CanvasNodeView(props: {
   return <TextNode {...props} />
 }
 
+function NodeResizeHandles({
+  node,
+  onResize,
+  onResizeEnd,
+  zoom,
+}: {
+  node: CanvasNode
+  onResize: (box: NodeBox) => void
+  onResizeEnd: (box: NodeBox, previous: NodeBox) => void
+  zoom: number
+}) {
+  const resize = useRef<{
+    handle: ResizeHandle
+    startX: number
+    startY: number
+    box: NodeBox
+  } | null>(null)
+  const handles: Array<{ handle: ResizeHandle; className: string }> = [
+    { handle: "nw", className: "-left-1.5 -top-1.5 cursor-nwse-resize" },
+    { handle: "n", className: "left-1/2 -top-1.5 -translate-x-1/2 cursor-ns-resize" },
+    { handle: "ne", className: "-right-1.5 -top-1.5 cursor-nesw-resize" },
+    { handle: "e", className: "-right-1.5 top-1/2 -translate-y-1/2 cursor-ew-resize" },
+    { handle: "se", className: "-bottom-1.5 -right-1.5 cursor-nwse-resize" },
+    { handle: "s", className: "-bottom-1.5 left-1/2 -translate-x-1/2 cursor-ns-resize" },
+    { handle: "sw", className: "-bottom-1.5 -left-1.5 cursor-nesw-resize" },
+    { handle: "w", className: "-left-1.5 top-1/2 -translate-y-1/2 cursor-ew-resize" },
+  ]
+
+  function pointerDown(handle: ResizeHandle, event: PointerEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    resize.current = {
+      handle,
+      startX: event.clientX,
+      startY: event.clientY,
+      box: { x: node.x, y: node.y, width: node.width, height: node.height },
+    }
+  }
+
+  function pointerMove(event: PointerEvent<HTMLButtonElement>) {
+    if (!resize.current) return
+    event.preventDefault()
+    event.stopPropagation()
+    onResize(
+      resizeNodeBox(
+        resize.current.box,
+        resize.current.handle,
+        (event.clientX - resize.current.startX) / zoom,
+        (event.clientY - resize.current.startY) / zoom,
+      ),
+    )
+  }
+
+  function pointerUp(event: PointerEvent<HTMLButtonElement>) {
+    if (!resize.current) return
+    event.preventDefault()
+    event.stopPropagation()
+    const previous = resize.current.box
+    const next = resizeNodeBox(
+      previous,
+      resize.current.handle,
+      (event.clientX - resize.current.startX) / zoom,
+      (event.clientY - resize.current.startY) / zoom,
+    )
+    resize.current = null
+    onResizeEnd(next, previous)
+  }
+
+  return (
+    <>
+      {handles.map(({ handle, className }) => (
+        <button
+          className={cn(
+            "absolute z-40 size-3 rounded-full border border-[#09090b] bg-[#e4e4e7] opacity-80 transition hover:scale-110 hover:opacity-100",
+            className,
+          )}
+          data-node-control="true"
+          key={handle}
+          onPointerDown={(event) => pointerDown(handle, event)}
+          onPointerMove={pointerMove}
+          onPointerUp={pointerUp}
+          type="button"
+        />
+      ))}
+    </>
+  )
+}
+
 function TextNode({
   disableDrag,
   node,
@@ -1619,7 +2457,10 @@ function TextNode({
   onDrag,
   onDragEnd,
   onHeadingChange,
+  onResize,
+  onResizeEnd,
   onSelect,
+  onStartEdit,
   onTextChange,
   selected,
   zoom,
@@ -1629,20 +2470,37 @@ function TextNode({
   onCenter: () => void
   onDelete: () => void
   onDrag: (x: number, y: number) => void
-  onDragEnd: (x: number, y: number) => void
+  onDragEnd: (x: number, y: number, previousX: number, previousY: number) => void
   onHeadingChange: (heading: string) => void
-  onSelect: () => void
+  onResize: (box: NodeBox) => void
+  onResizeEnd: (box: NodeBox, previous: NodeBox) => void
+  onSelect: (event: PointerEvent<HTMLDivElement>) => void
+  onStartEdit: () => void
   onTextChange: (text: string) => void
   selected: boolean
   zoom: number
 }) {
   const drag = useRef<{ startX: number; startY: number; nodeX: number; nodeY: number } | null>(null)
+  const selectedClickRef = useRef(false)
+  const movedRef = useRef(false)
   const [editing, setEditing] = useState(false)
   const [draftText, setDraftText] = useState(node.text ?? "")
 
+  useEffect(() => {
+    setDraftText(node.text ?? "")
+  }, [node.text])
+
+  useEffect(() => {
+    if (!selected) setEditing(false)
+  }, [selected])
+
   function pointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (disableDrag) return
     if ((event.target as HTMLElement).closest("[data-node-control='true']")) return
+    selectedClickRef.current = selected
+    movedRef.current = false
+    onSelect(event)
+    if (disableDrag || event.shiftKey) return
+
     event.currentTarget.setPointerCapture(event.pointerId)
     drag.current = {
       startX: event.clientX,
@@ -1650,11 +2508,13 @@ function TextNode({
       nodeX: node.x,
       nodeY: node.y,
     }
-    onSelect()
   }
 
   function pointerMove(event: PointerEvent<HTMLDivElement>) {
     if (!drag.current) return
+    if (Math.hypot(event.clientX - drag.current.startX, event.clientY - drag.current.startY) > 3) {
+      movedRef.current = true
+    }
     onDrag(
       drag.current.nodeX + (event.clientX - drag.current.startX) / zoom,
       drag.current.nodeY + (event.clientY - drag.current.startY) / zoom,
@@ -1663,23 +2523,30 @@ function TextNode({
 
   function pointerUp(event: PointerEvent<HTMLDivElement>) {
     if (!drag.current) return
+    const previousX = drag.current.nodeX
+    const previousY = drag.current.nodeY
     const x = drag.current.nodeX + (event.clientX - drag.current.startX) / zoom
     const y = drag.current.nodeY + (event.clientY - drag.current.startY) / zoom
     drag.current = null
-    onDragEnd(x, y)
+    onDragEnd(x, y, previousX, previousY)
+    if (selectedClickRef.current && !movedRef.current && !editing) {
+      onStartEdit()
+      setDraftText(node.text ?? "")
+      setEditing(true)
+    }
   }
 
   return (
     <div
       className={cn(
-        "group absolute overflow-visible",
-        selected && "z-20",
+        "group absolute z-20 overflow-visible",
+        selected && "z-30",
       )}
       onDoubleClick={onCenter}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
-      style={{ left: node.x, top: node.y, width: node.width, minHeight: node.height }}
+      style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
       <div className="absolute -top-9 left-2 right-2 z-0 flex translate-y-3 items-center gap-2 rounded-t-md border border-[#3f3f46]/80 bg-[#18181b]/70 px-2 py-1 opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100">
         <input
@@ -1701,14 +2568,14 @@ function TextNode({
       </div>
       <div
         className={cn(
-          "relative z-10 min-h-[inherit] rounded-lg border bg-[#18181b]/60 p-3 shadow-sm backdrop-blur-md transition",
+          "relative z-10 h-full rounded-lg border bg-[#18181b]/60 p-3 shadow-sm backdrop-blur-md transition",
           selected ? "border-[#e4e4e7]" : "border-[#3f3f46]/70",
         )}
       >
         {editing ? (
           <textarea
             autoFocus
-            className="min-h-[inherit] w-full resize-none bg-transparent text-sm leading-6 text-[#e4e4e7] outline-none placeholder:text-[#71717a]"
+            className="h-full w-full resize-none bg-transparent text-sm leading-6 text-[#e4e4e7] outline-none placeholder:text-[#71717a]"
             data-node-control="true"
             onBlur={() => {
               onTextChange(draftText)
@@ -1728,7 +2595,7 @@ function TextNode({
           />
         ) : (
           <div
-            className="min-h-[inherit] text-[#e4e4e7]"
+            className="h-full overflow-auto text-[#e4e4e7]"
             onDoubleClick={(event) => {
               event.stopPropagation()
               setDraftText(node.text ?? "")
@@ -1741,6 +2608,9 @@ function TextNode({
           </div>
         )}
       </div>
+      {selected ? (
+        <NodeResizeHandles node={node} onResize={onResize} onResizeEnd={onResizeEnd} zoom={zoom} />
+      ) : null}
     </div>
   )
 }
@@ -1753,6 +2623,8 @@ function ImageNode({
   onDrag,
   onDragEnd,
   onHeadingChange,
+  onResize,
+  onResizeEnd,
   onSelect,
   selected,
   zoom,
@@ -1762,17 +2634,22 @@ function ImageNode({
   onCenter: () => void
   onDelete: () => void
   onDrag: (x: number, y: number) => void
-  onDragEnd: (x: number, y: number) => void
+  onDragEnd: (x: number, y: number, previousX: number, previousY: number) => void
   onHeadingChange: (heading: string) => void
-  onSelect: () => void
+  onResize: (box: NodeBox) => void
+  onResizeEnd: (box: NodeBox, previous: NodeBox) => void
+  onSelect: (event: PointerEvent<HTMLDivElement>) => void
+  onStartEdit: () => void
   selected: boolean
   zoom: number
 }) {
   const drag = useRef<{ startX: number; startY: number; nodeX: number; nodeY: number } | null>(null)
 
   function pointerDown(event: PointerEvent<HTMLDivElement>) {
-    if (disableDrag) return
     if ((event.target as HTMLElement).closest("[data-node-control='true']")) return
+    onSelect(event)
+    if (disableDrag || event.shiftKey) return
+
     event.currentTarget.setPointerCapture(event.pointerId)
     drag.current = {
       startX: event.clientX,
@@ -1780,7 +2657,6 @@ function ImageNode({
       nodeX: node.x,
       nodeY: node.y,
     }
-    onSelect()
   }
 
   function pointerMove(event: PointerEvent<HTMLDivElement>) {
@@ -1793,20 +2669,22 @@ function ImageNode({
 
   function pointerUp(event: PointerEvent<HTMLDivElement>) {
     if (!drag.current) return
+    const previousX = drag.current.nodeX
+    const previousY = drag.current.nodeY
     const x = drag.current.nodeX + (event.clientX - drag.current.startX) / zoom
     const y = drag.current.nodeY + (event.clientY - drag.current.startY) / zoom
     drag.current = null
-    onDragEnd(x, y)
+    onDragEnd(x, y, previousX, previousY)
   }
 
   return (
     <div
-      className={cn("group absolute overflow-visible", selected && "z-20")}
+      className={cn("group absolute z-20 overflow-visible", selected && "z-30")}
       onDoubleClick={onCenter}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
-      style={{ left: node.x, top: node.y, width: node.width }}
+      style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
       <div className="absolute -top-9 left-2 right-2 z-0 flex translate-y-3 items-center gap-2 rounded-t-md border border-[#3f3f46]/80 bg-[#18181b]/70 px-2 py-1 opacity-0 shadow-sm backdrop-blur-md transition group-hover:translate-y-0 group-hover:opacity-100">
         <input
@@ -1831,13 +2709,16 @@ function ImageNode({
         <img
           alt={nodeHeading(node)}
           className={cn(
-            "relative z-10 block max-w-none rounded-md shadow-sm",
+            "relative z-10 block max-w-none rounded-md object-cover shadow-sm",
             selected && "outline outline-2 outline-[#e4e4e7]",
           )}
           draggable={false}
           src={node.imageUrl ?? node.localImageUrl}
-          style={{ width: node.width, height: "auto" }}
+          style={{ width: node.width, height: node.height }}
         />
+      ) : null}
+      {selected ? (
+        <NodeResizeHandles node={node} onResize={onResize} onResizeEnd={onResizeEnd} zoom={zoom} />
       ) : null}
     </div>
   )

@@ -104,6 +104,20 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_session", ["sessionId", "updatedAt"]),
 
+  groups: defineTable({
+    sessionId: v.id("sessions"),
+    name: v.string(),
+    nodeIds: v.array(v.string()),
+    x: v.number(),
+    y: v.number(),
+    width: v.number(),
+    height: v.number(),
+    createdByUserId: v.string(),
+    updatedByUserId: v.string(),
+    updatedAt: v.number(),
+    createdAt: v.number(),
+  }).index("by_session", ["sessionId", "updatedAt"]),
+
   messages: defineTable({
     sessionId: v.id("sessions"),
     userId: v.string(),
